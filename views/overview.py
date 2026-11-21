@@ -1,23 +1,29 @@
-"""Interactive dashboard for exploring sample network traffic."""
+"""Interactive dashboard for exploring cybersecurity traffic records."""
 
+import hashlib
 import time
+from math import gcd
+
 import pandas as pd
-import streamlit as st
 import plotly.express as px
+import streamlit as st
 
 from data_utils import filter_traffic, format_bytes, load_data
 
 
-# ---------- Page setup ----------
-
-st.set_page_config(
-    page_title="Cybersecurity Traffic Explorer",
-    page_icon=None,
-    layout="wide",
-)
+# Page configuration is handled by the root app.py entrypoint.
 
 
-# ---------- Interface components ----------
+ANIMATION_DURATIONS = {
+    "Slow": 12.0,
+    "Medium": 8.0,
+    "Fast": 4.0,
+}
+
+ANIMATION_SIGNATURE_KEY = "overview_last_activity_signature"
+
+
+# ---------- Summary metrics ----------
 
 def render_metrics(df: pd.DataFrame) -> None:
     """Show summary values for the current selection."""
@@ -44,13 +50,35 @@ def render_metrics(df: pd.DataFrame) -> None:
     )
 
 
-def render_activity_chart(df: pd.DataFrame) -> None:
-    """Display daily activity with an optional progressive animation."""
+# ---------- Activity animation ----------
+
+def build_activity_signature(
+    daily_activity: pd.DataFrame,
+    filter_signature: tuple,
+) -> str:
+    """Identify the chart data and filters used for the current view."""
+    signature_text = (
+        repr(filter_signature)
+        + "\n"
+        + daily_activity.to_csv()
+    )
+
+    return hashlib.sha256(
+        signature_text.encode("utf-8")
+    ).hexdigest()
+
+
+def render_activity_chart(
+    df: pd.DataFrame,
+    filter_signature: tuple,
+) -> None:
+    """Display daily activity with automatic and manual playback."""
     st.subheader("Network activity over time")
 
     st.caption(
-        "Each point represents one day. Play the animation "
-        "to reveal the selected period from left to right."
+        "Each point represents one day. The chart automatically "
+        "plays at Medium speed when first loaded or when the "
+        "date or protocol filters change."
     )
 
     daily_activity = (
@@ -61,56 +89,94 @@ def render_activity_chart(df: pd.DataFrame) -> None:
         .to_frame()
     )
 
+    chart_signature = build_activity_signature(
+        daily_activity,
+        filter_signature,
+    )
+
+    previous_signature = st.session_state.get(
+        ANIMATION_SIGNATURE_KEY
+    )
+
+    auto_play = previous_signature != chart_signature
+    can_animate = len(daily_activity) >= 2
+
     controls_col, speed_col = st.columns([2, 1])
 
     with controls_col:
         play_animation = st.button(
             "Play activity animation",
-            key="play_activity_animation",
-            disabled=len(daily_activity) < 2,
+            key="overview_play_activity_animation",
+            disabled=not can_animate,
         )
 
     with speed_col:
         animation_speed = st.selectbox(
-            "Animation speed",
-            options=["Slow", "Normal", "Fast"],
+            "Replay speed",
+            options=list(ANIMATION_DURATIONS),
             index=1,
-            key="activity_animation_speed",
+            key="overview_activity_animation_speed",
+            help=(
+                "Controls manual replay. Automatic playback "
+                "always uses Medium speed."
+            ),
         )
 
     chart_placeholder = st.empty()
 
-    if play_animation and len(daily_activity) >= 2:
-        duration_seconds = {
-            "Slow": 6.0,
-            "Normal": 3.0,
-            "Fast": 1.0,
-        }[animation_speed]
+    # Manual replay uses the selected speed.
+    # Automatic playback always uses Medium.
+    playback_speed = (
+        animation_speed if play_animation else "Medium"
+    )
 
-        # Limit redraws for datasets covering longer periods.
-        frame_count = min(len(daily_activity), 40)
+    should_animate = (
+        can_animate
+        and (play_animation or auto_play)
+    )
 
-        endpoints = sorted(
-            {
-                1 + round(
-                    frame * (len(daily_activity) - 1)
-                    / (frame_count - 1)
-                )
-                for frame in range(frame_count)
-            }
+    if should_animate:
+        duration_seconds = ANIMATION_DURATIONS[playback_speed]
+
+        # Bound the number of chart redraws for longer datasets.
+        frame_count = min(len(daily_activity), 60)
+
+        endpoints = [
+            1 + round(
+                frame * (len(daily_activity) - 1)
+                / (frame_count - 1)
+            )
+            for frame in range(frame_count)
+        ]
+
+        # Remove duplicate endpoints while retaining their order.
+        endpoints = list(dict.fromkeys(endpoints))
+
+        frame_interval = (
+            duration_seconds / (len(endpoints) - 1)
         )
 
-        delay = duration_seconds / max(len(endpoints) - 1, 1)
+        animation_start = time.monotonic()
 
-        for frame_index, end in enumerate(endpoints):
-            chart_placeholder.line_chart(
-                daily_activity.iloc[:end],
-                color="#38BDF8",
-                height=320,
-            )
+        with st.spinner(
+            f"Playing activity at {playback_speed.lower()} speed..."
+        ):
+            for frame_index, end in enumerate(endpoints):
+                target_time = (
+                    animation_start
+                    + frame_index * frame_interval
+                )
 
-            if frame_index < len(endpoints) - 1:
-                time.sleep(delay)
+                remaining = target_time - time.monotonic()
+
+                if remaining > 0:
+                    time.sleep(remaining)
+
+                chart_placeholder.line_chart(
+                    daily_activity.iloc[:end],
+                    color="#38BDF8",
+                    height=320,
+                )
 
     else:
         chart_placeholder.line_chart(
@@ -119,12 +185,23 @@ def render_activity_chart(df: pd.DataFrame) -> None:
             height=320,
         )
 
-    if len(daily_activity) < 2:
+    # Record the signature after rendering completes.
+    st.session_state[ANIMATION_SIGNATURE_KEY] = chart_signature
+
+    if not can_animate:
         st.caption(
-            "Select a date range containing at least two days "
-            "to play the animation."
+            "At least two days of activity are needed "
+            "for animation."
+        )
+    else:
+        st.caption(
+            "Manual replay: Slow ≈ 12 seconds, Medium ≈ 8 seconds, "
+            "Fast ≈ 4 seconds. This is a replay of dataset records, "
+            "not a live network feed."
         )
 
+
+# ---------- Comparison charts ----------
 
 def render_comparison_charts(df: pd.DataFrame) -> None:
     """Compare protocols and destination-port frequencies."""
@@ -179,6 +256,8 @@ def render_comparison_charts(df: pd.DataFrame) -> None:
         )
 
 
+# ---------- Records table ----------
+
 def render_records(df: pd.DataFrame) -> None:
     """Display and export the filtered records."""
     st.subheader("Explore matching records")
@@ -186,6 +265,7 @@ def render_records(df: pd.DataFrame) -> None:
     newest_first = st.checkbox(
         "Show newest records first",
         value=True,
+        key="overview_newest_first",
     )
 
     display_df = df.sort_values(
@@ -204,34 +284,82 @@ def render_records(df: pd.DataFrame) -> None:
         data=display_df.to_csv(index=False).encode("utf-8"),
         file_name="filtered_network_traffic.csv",
         mime="text/csv",
+        key="overview_download_records",
     )
 
 
-def render_about() -> None:
-    """Explain the prototype's purpose and limitations."""
-    with st.expander("About this prototype"):
-        st.write(
-            "This prototype demonstrates an interactive "
-            "network-traffic dashboard using reproducible "
-            "sample data. Its charts describe record counts "
-            "and traffic volume; they do not establish "
-            "whether activity is malicious."
+# ---------- Source activity ----------
+
+def render_source_summary(df: pd.DataFrame) -> None:
+    """Identify the most active sources by record count."""
+    source_counts = df["source_ip"].dropna().value_counts()
+
+    if source_counts.empty:
+        st.info("No source IP addresses are available.")
+        return
+
+    highest_count = int(source_counts.max())
+
+    leaders = source_counts[
+        source_counts == highest_count
+    ].index.tolist()
+
+    activity_col, count_col, share_col = st.columns(3)
+
+    activity_col.metric(
+        "Most active source IP",
+        str(leaders[0]) if len(leaders) == 1 else "Multiple tied",
+    )
+
+    count_col.metric(
+        "Records per leading source",
+        f"{highest_count:,}",
+    )
+
+    share_col.metric(
+        "Share per leading source",
+        f"{highest_count / len(df):.2%}",
+    )
+
+    if len(leaders) > 1:
+        st.caption(
+            f"{len(leaders):,} source IPs tie at "
+            f"{highest_count:,} record(s) each. "
+            "There is no unique most-active source by record count."
         )
 
-        st.write(
-            "The animation replays the selected sample data. "
-            "It is not a live network feed."
+    with st.expander("View up to 10 leading source IPs"):
+        ranking = (
+            source_counts
+            .rename_axis("Source IP")
+            .reset_index(name="Records")
+            .sort_values(
+                ["Records", "Source IP"],
+                ascending=[False, True],
+            )
+            .head(10)
         )
 
-        st.write(
-            "The next development step is to replace the "
-            "sample data loader with a loader for the Kaggle "
-            "dataset and map its actual columns to this "
-            "interface."
+        ranking["Share of filtered records (%)"] = (
+            ranking["Records"] / len(df) * 100
+        ).round(2)
+
+        st.dataframe(
+            ranking,
+            hide_index=True,
+            use_container_width=True,
         )
+
+        st.caption(
+            "Tied sources are ordered by their IP address text. "
+            "Only the first 10 are displayed."
+        )
+
+
+# ---------- Attack insights ----------
 
 def render_security_summary(df: pd.DataFrame) -> None:
-    """Summarize source activity and verified dataset labels."""
+    """Summarize source activity and dataset-provided labels."""
     st.subheader("Traffic and attack insights")
 
     st.caption(
@@ -243,74 +371,18 @@ def render_security_summary(df: pd.DataFrame) -> None:
         st.info("No records are available for this selection.")
         return
 
-    # ---------- Most active source ----------
-
-    source_counts = df["source_ip"].dropna().value_counts()
-
-    if source_counts.empty:
-        st.info("No source IP addresses are available.")
-    else:
-        highest_count = int(source_counts.max())
-        leaders = source_counts[
-            source_counts == highest_count
-        ].index.tolist()
-
-        activity_col, count_col, share_col = st.columns(3)
-
-        activity_col.metric(
-            "Most active source IP",
-            str(leaders[0]) if len(leaders) == 1 else "Multiple tied",
-        )
-
-        count_col.metric(
-            "Records from this source",
-            f"{highest_count:,}",
-        )
-
-        share_col.metric(
-            "Share of filtered records",
-            f"{highest_count / len(df):.1%}",
-        )
-
-        if len(leaders) > 1:
-            st.caption(
-                f"{len(leaders):,} source IPs tie at "
-                f"{highest_count:,} record(s) each. "
-                "There is no unique most-active source by record count."
-            )
-
-        with st.expander("View the top 10 source IPs"):
-            ranking = (
-                source_counts.head(10)
-                .rename_axis("Source IP")
-                .reset_index(name="Records")
-            )
-
-            ranking["Share of filtered records (%)"] = (
-                ranking["Records"] / len(df) * 100
-            ).round(2)
-
-            st.dataframe(
-                ranking,
-                hide_index=True,
-                use_container_width=True,
-            )
+    render_source_summary(df)
 
     st.divider()
 
-    # ---------- Verified traffic classification ----------
-
     if "traffic_label" not in df.columns:
         st.info(
-            "Attack analysis is not available yet. The current "
-            "sample data has no attack labels. After we connect "
-            "the real CSV, we will map its verified classification "
-            "and attack-type columns."
+            "Attack analysis is unavailable because a "
+            "traffic_label column has not been provided "
+            "by the data loader."
         )
         return
 
-    # Accept only explicitly mapped Attack/Normal values.
-    # Missing or unexpected values remain unclassified.
     labels = (
         df["traffic_label"]
         .astype("string")
@@ -329,6 +401,7 @@ def render_security_summary(df: pd.DataFrame) -> None:
 
     attack_count = int(attack_mask.sum())
     normal_count = int(normal_mask.sum())
+
     classified_count = attack_count + normal_count
     unclassified_count = len(df) - classified_count
 
@@ -341,8 +414,6 @@ def render_security_summary(df: pd.DataFrame) -> None:
 
     type_col, balance_col = st.columns(2)
 
-    # ---------- Attack-type distribution ----------
-
     with type_col:
         st.markdown("### Distribution of attack types")
 
@@ -352,7 +423,7 @@ def render_security_summary(df: pd.DataFrame) -> None:
         elif "attack_type" not in df.columns:
             st.info(
                 "Attack labels are available, but an attack-type "
-                "column has not been mapped yet."
+                "column has not been mapped."
             )
 
         else:
@@ -403,8 +474,6 @@ def render_security_summary(df: pd.DataFrame) -> None:
                 "Missing attack categories appear as Unspecified."
             )
 
-    # ---------- Attack-versus-normal distribution ----------
-
     with balance_col:
         st.markdown("### Attacks vs normal traffic")
 
@@ -453,8 +522,6 @@ def render_security_summary(df: pd.DataFrame) -> None:
             "Normal; unclassified records are excluded."
         )
 
-    # ---------- Counts and ratio ----------
-
     attack_col, normal_col, ratio_col = st.columns(3)
 
     attack_col.metric(
@@ -476,17 +543,28 @@ def render_security_summary(df: pd.DataFrame) -> None:
     )
 
     if normal_count > 0:
+        common_divisor = gcd(attack_count, normal_count)
+
+        attack_part = attack_count // common_divisor
+        normal_part = normal_count // common_divisor
+
         ratio_col.metric(
             "Attack-to-normal ratio",
-            f"{attack_count / normal_count:.2f}:1",
+            f"{attack_part}:{normal_part}",
+            help=(
+                "Exact reduced ratio of attack-labeled records "
+                "to normal-labeled records."
+            ),
         )
+
     else:
         ratio_col.metric(
             "Attack-to-normal ratio",
             "N/A",
         )
+
         st.caption(
-            "The attack-to-normal ratio is undefined because "
+            "The attack-to-normal quotient is undefined because "
             "there are no labeled normal records."
         )
 
@@ -501,6 +579,38 @@ def render_security_summary(df: pd.DataFrame) -> None:
         "These are dataset-provided designations, "
         "not attacks independently detected by this app."
     )
+
+
+# ---------- About ----------
+
+def render_about() -> None:
+    """Explain the dashboard's purpose and limitations."""
+    with st.expander("About this dashboard"):
+        st.write(
+            "This dashboard explores records from the Kaggle "
+            "Cybersecurity Threat Detection Dataset stored "
+            "in cybersecurity.csv."
+        )
+
+        st.write(
+            "Filters apply to the summary metrics, charts, "
+            "records table, and downloadable CSV. Attack charts "
+            "use the classifications supplied in the dataset."
+        )
+
+        st.write(
+            "The activity animation replays historical records. "
+            "It is not a live network feed or an independent "
+            "intrusion-detection system."
+        )
+
+        st.write(
+            "Source activity is measured by record count. "
+            "If multiple addresses have the same highest count, "
+            "the dashboard reports a tie rather than choosing "
+            "an arbitrary winner."
+        )
+
 
 # ---------- App ----------
 
@@ -523,18 +633,17 @@ def main() -> None:
     with st.sidebar:
         st.header("Filter traffic")
 
-        st.caption(
-            "Data source: cybersecurity.csv"
-        )
+        st.caption("Data source: cybersecurity.csv")
 
         protocol_options = sorted(
-            df["protocol"].unique().tolist()
+            df["protocol"].dropna().unique().tolist()
         )
 
         selected_protocols = st.multiselect(
             "Protocols",
             options=protocol_options,
             default=protocol_options,
+            key="overview_protocols",
         )
 
         earliest = df["timestamp"].min().date()
@@ -545,6 +654,7 @@ def main() -> None:
             value=(earliest, latest),
             min_value=earliest,
             max_value=latest,
+            key="overview_dates",
         )
 
         st.divider()
@@ -555,6 +665,12 @@ def main() -> None:
         )
 
     if len(selected_dates) != 2:
+        # Replay when a complete date selection is restored.
+        st.session_state.pop(
+            ANIMATION_SIGNATURE_KEY,
+            None,
+        )
+
         st.warning(
             "Select both a start date and an end date."
         )
@@ -576,26 +692,39 @@ def main() -> None:
     )
 
     render_metrics(filtered_df)
+
     st.divider()
 
     if filtered_df.empty:
+        # Replay when the user returns to a nonempty selection.
+        st.session_state.pop(
+            ANIMATION_SIGNATURE_KEY,
+            None,
+        )
+
         st.warning(
             "No records match these filters. Select a protocol "
             "or expand the date range."
         )
+
         render_about()
         st.stop()
 
-    render_activity_chart(filtered_df)
-    
+    filter_signature = (
+        tuple(sorted(selected_protocols)),
+        start_date.isoformat(),
+        end_date.isoformat(),
+    )
+
+    render_activity_chart(
+        filtered_df,
+        filter_signature,
+    )
+
     st.divider()
-    
+
     render_security_summary(filtered_df)
 
-    st.divider()
-
-    render_activity_chart(filtered_df)
-    
     st.divider()
 
     render_comparison_charts(filtered_df)
@@ -605,6 +734,7 @@ def main() -> None:
     render_records(filtered_df)
 
     render_about()
+
 
 if __name__ == "__main__":
     main()
