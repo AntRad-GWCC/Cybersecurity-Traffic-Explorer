@@ -3,7 +3,7 @@
 import pandas as pd
 import streamlit as st
 
-from data_utils import filter_traffic, format_bytes, load_demo_data
+from data_utils import filter_traffic, format_bytes, load_data
 
 
 def render_metrics(df: pd.DataFrame) -> None:
@@ -203,12 +203,12 @@ def main() -> None:
     )
 
     st.info(
-        "Demo mode: these are generated sample records. "
-        "This page describes network activity; it does not "
-        "determine whether a connection is malicious."
+        "This page explores records from the uploaded dataset. "
+        "Traffic volume and destination counts alone do not "
+        "establish whether activity is malicious."
     )
 
-    df = load_demo_data()
+    df = load_data()
 
     # Sort generated IPv4 addresses numerically rather than alphabetically.
     source_options = sorted(

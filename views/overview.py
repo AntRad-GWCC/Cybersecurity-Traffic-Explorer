@@ -1,11 +1,11 @@
 """Interactive dashboard for exploring sample network traffic."""
 
 import time
-
 import pandas as pd
 import streamlit as st
+import plotly.express as px
 
-from data_utils import filter_traffic, format_bytes, load_demo_data
+from data_utils import filter_traffic, format_bytes, load_data
 
 
 # ---------- Page setup ----------
@@ -230,6 +230,277 @@ def render_about() -> None:
             "interface."
         )
 
+def render_security_summary(df: pd.DataFrame) -> None:
+    """Summarize source activity and verified dataset labels."""
+    st.subheader("Traffic and attack insights")
+
+    st.caption(
+        "All results reflect the current overview filters. "
+        "Activity is measured by record count, not threat severity."
+    )
+
+    if df.empty:
+        st.info("No records are available for this selection.")
+        return
+
+    # ---------- Most active source ----------
+
+    source_counts = df["source_ip"].dropna().value_counts()
+
+    if source_counts.empty:
+        st.info("No source IP addresses are available.")
+    else:
+        highest_count = int(source_counts.max())
+        leaders = source_counts[
+            source_counts == highest_count
+        ].index.tolist()
+
+        activity_col, count_col, share_col = st.columns(3)
+
+        activity_col.metric(
+            "Most active source IP",
+            str(leaders[0]) if len(leaders) == 1 else "Multiple tied",
+        )
+
+        count_col.metric(
+            "Records from this source",
+            f"{highest_count:,}",
+        )
+
+        share_col.metric(
+            "Share of filtered records",
+            f"{highest_count / len(df):.1%}",
+        )
+
+        if len(leaders) > 1:
+            st.caption(
+                f"{len(leaders):,} source IPs tie at "
+                f"{highest_count:,} record(s) each. "
+                "There is no unique most-active source by record count."
+            )
+
+        with st.expander("View the top 10 source IPs"):
+            ranking = (
+                source_counts.head(10)
+                .rename_axis("Source IP")
+                .reset_index(name="Records")
+            )
+
+            ranking["Share of filtered records (%)"] = (
+                ranking["Records"] / len(df) * 100
+            ).round(2)
+
+            st.dataframe(
+                ranking,
+                hide_index=True,
+                use_container_width=True,
+            )
+
+    st.divider()
+
+    # ---------- Verified traffic classification ----------
+
+    if "traffic_label" not in df.columns:
+        st.info(
+            "Attack analysis is not available yet. The current "
+            "sample data has no attack labels. After we connect "
+            "the real CSV, we will map its verified classification "
+            "and attack-type columns."
+        )
+        return
+
+    # Accept only explicitly mapped Attack/Normal values.
+    # Missing or unexpected values remain unclassified.
+    labels = (
+        df["traffic_label"]
+        .astype("string")
+        .str.strip()
+        .str.casefold()
+        .map(
+            {
+                "attack": "Attack",
+                "normal": "Normal",
+            }
+        )
+    )
+
+    attack_mask = labels.eq("Attack").fillna(False)
+    normal_mask = labels.eq("Normal").fillna(False)
+
+    attack_count = int(attack_mask.sum())
+    normal_count = int(normal_mask.sum())
+    classified_count = attack_count + normal_count
+    unclassified_count = len(df) - classified_count
+
+    if classified_count == 0:
+        st.warning(
+            "No recognized Attack or Normal labels are available "
+            "in this selection. Check the dataset label mapping."
+        )
+        return
+
+    type_col, balance_col = st.columns(2)
+
+    # ---------- Attack-type distribution ----------
+
+    with type_col:
+        st.markdown("### Distribution of attack types")
+
+        if attack_count == 0:
+            st.info("No labeled attacks in this selection.")
+
+        elif "attack_type" not in df.columns:
+            st.info(
+                "Attack labels are available, but an attack-type "
+                "column has not been mapped yet."
+            )
+
+        else:
+            attack_types = (
+                df.loc[attack_mask, "attack_type"]
+                .astype("string")
+                .str.strip()
+                .replace("", pd.NA)
+                .fillna("Unspecified")
+            )
+
+            type_counts = (
+                attack_types.value_counts()
+                .rename_axis("Attack type")
+                .reset_index(name="Records")
+            )
+
+            type_figure = px.pie(
+                type_counts,
+                names="Attack type",
+                values="Records",
+                hole=0.35,
+            )
+
+            type_figure.update_traces(
+                textinfo="percent",
+                hovertemplate=(
+                    "%{label}<br>"
+                    "Records: %{value:,}<br>"
+                    "Share of labeled attacks: %{percent}"
+                    "<extra></extra>"
+                ),
+            )
+
+            type_figure.update_layout(
+                margin=dict(t=20, b=20, l=10, r=10),
+                legend_title_text="Attack type",
+            )
+
+            st.plotly_chart(
+                type_figure,
+                use_container_width=True,
+                key="overview_attack_type_pie",
+            )
+
+            st.caption(
+                "Percentages use labeled attack records only. "
+                "Missing attack categories appear as Unspecified."
+            )
+
+    # ---------- Attack-versus-normal distribution ----------
+
+    with balance_col:
+        st.markdown("### Attacks vs normal traffic")
+
+        balance = pd.DataFrame(
+            {
+                "Classification": ["Attack", "Normal"],
+                "Records": [attack_count, normal_count],
+            }
+        )
+
+        balance_figure = px.pie(
+            balance,
+            names="Classification",
+            values="Records",
+            hole=0.55,
+            color="Classification",
+            color_discrete_map={
+                "Attack": "#F87171",
+                "Normal": "#2DD4BF",
+            },
+        )
+
+        balance_figure.update_traces(
+            textinfo="label+percent",
+            hovertemplate=(
+                "%{label}<br>"
+                "Records: %{value:,}<br>"
+                "Share of classified records: %{percent}"
+                "<extra></extra>"
+            ),
+        )
+
+        balance_figure.update_layout(
+            margin=dict(t=20, b=20, l=10, r=10),
+            showlegend=False,
+        )
+
+        st.plotly_chart(
+            balance_figure,
+            use_container_width=True,
+            key="overview_attack_normal_pie",
+        )
+
+        st.caption(
+            "Percentages use records classified as Attack or "
+            "Normal; unclassified records are excluded."
+        )
+
+    # ---------- Counts and ratio ----------
+
+    attack_col, normal_col, ratio_col = st.columns(3)
+
+    attack_col.metric(
+        "Labeled attacks",
+        f"{attack_count:,}",
+        help=(
+            f"{attack_count / classified_count:.1%} "
+            "of classified records"
+        ),
+    )
+
+    normal_col.metric(
+        "Labeled normal",
+        f"{normal_count:,}",
+        help=(
+            f"{normal_count / classified_count:.1%} "
+            "of classified records"
+        ),
+    )
+
+    if normal_count > 0:
+        ratio_col.metric(
+            "Attack-to-normal ratio",
+            f"{attack_count / normal_count:.2f}:1",
+        )
+    else:
+        ratio_col.metric(
+            "Attack-to-normal ratio",
+            "N/A",
+        )
+        st.caption(
+            "The attack-to-normal ratio is undefined because "
+            "there are no labeled normal records."
+        )
+
+    if unclassified_count:
+        st.warning(
+            f"{unclassified_count:,} records have missing or "
+            "unrecognized classification labels and are excluded "
+            "from attack-versus-normal calculations."
+        )
+
+    st.caption(
+        "These are dataset-provided designations, "
+        "not attacks independently detected by this app."
+    )
 
 # ---------- App ----------
 
@@ -242,18 +513,18 @@ def main() -> None:
     )
 
     st.info(
-        "Demo mode: all records in this mockup are generated "
-        "sample data. This app does not monitor a network "
-        "or detect attacks."
+        "Data source: Kaggle Cybersecurity Threat Detection Dataset. "
+        "Attack classifications come from the dataset labels; "
+        "this app does not independently detect attacks."
     )
 
-    df = load_demo_data()
+    df = load_data()
 
     with st.sidebar:
         st.header("Filter traffic")
 
         st.caption(
-            "Data source: generated demonstration data"
+            "Data source: cybersecurity.csv"
         )
 
         protocol_options = sorted(
@@ -316,7 +587,15 @@ def main() -> None:
         st.stop()
 
     render_activity_chart(filtered_df)
+    
+    st.divider()
+    
+    render_security_summary(filtered_df)
 
+    st.divider()
+
+    render_activity_chart(filtered_df)
+    
     st.divider()
 
     render_comparison_charts(filtered_df)
@@ -326,7 +605,6 @@ def main() -> None:
     render_records(filtered_df)
 
     render_about()
-
 
 if __name__ == "__main__":
     main()
